@@ -18,6 +18,7 @@ import (
 	dynamicfake "k8s.io/client-go/dynamic/fake"
 	clienttesting "k8s.io/client-go/testing"
 	fn "knative.dev/func/pkg/functions"
+	"knative.dev/func/pkg/k8s"
 )
 
 func newScalingDynClient(objects ...runtime.Object) *dynamicfake.FakeDynamicClient {
@@ -380,45 +381,6 @@ func TestParseSecretRef(t *testing.T) {
 	}
 }
 
-func TestFindSecretForPath(t *testing.T) {
-	secret := "my-cluster-ca"
-	path := "/etc/kafka/ca"
-	volumes := []fn.Volume{
-		{Secret: &secret, Path: &path},
-	}
-
-	name, key := findSecretForPath("/etc/kafka/ca/ca.crt", volumes)
-	if name != "my-cluster-ca" || key != "ca.crt" {
-		t.Errorf("got (%q, %q), want (my-cluster-ca, ca.crt)", name, key)
-	}
-
-	name, _ = findSecretForPath("/other/path", volumes)
-	if name != "" {
-		t.Errorf("expected empty for non-matching path, got %q", name)
-	}
-
-	// Sibling directory sharing a prefix must not match (e.g. "/etc/kafka/ca"
-	// is not a parent of "/etc/kafka/cab/ca.crt").
-	name, _ = findSecretForPath("/etc/kafka/cab/ca.crt", volumes)
-	if name != "" {
-		t.Errorf("expected empty for sibling-directory path, got %q", name)
-	}
-
-	// certPath equal to the mount path names the directory, not a file in
-	// it: no valid Secret data key, so this must not match.
-	name, _ = findSecretForPath("/etc/kafka/ca", volumes)
-	if name != "" {
-		t.Errorf("expected empty when certPath is the mount path itself, got %q", name)
-	}
-
-	// A cert nested more than one level deep resolves to a rel containing a
-	// separator, which isn't a valid Secret data key either.
-	name, _ = findSecretForPath("/etc/kafka/ca/sub/ca.crt", volumes)
-	if name != "" {
-		t.Errorf("expected empty for a cert nested more than one level deep, got %q", name)
-	}
-}
-
 func testDeployment() *v1.Deployment {
 	return &v1.Deployment{
 		ObjectMeta: metav1.ObjectMeta{
@@ -429,31 +391,37 @@ func testDeployment() *v1.Deployment {
 		Spec: v1.DeploymentSpec{
 			Template: corev1.PodTemplateSpec{
 				Spec: corev1.PodSpec{
-					Containers: []corev1.Container{{Name: "user-container"}},
+					// Mirror the real deploy: user-container plus the Kafka
+					// runtime sidecar, which is where the SASL env vars live and
+					// where KEDA's env-based auth must be pointed.
+					Containers: []corev1.Container{
+						{Name: "user-container"},
+						{Name: k8s.KafkaSidecarName},
+					},
 				},
 			},
 		},
 	}
 }
 
-// TestBuildTriggerAuth_NoContainers verifies buildTriggerAuth returns an error
-// rather than panicking when the Deployment's pod template has no containers.
-// The env-ref (plaintext SASL) path indexes Containers[0]; the raw deployer
-// always produces exactly one container, but the guard keeps a future pod
-// template change from turning that index into a panic.
-func TestBuildTriggerAuth_NoContainers(t *testing.T) {
+// TestBuildTriggerAuth_NoSidecar verifies buildTriggerAuth returns an error
+// rather than panicking when the Deployment's pod template is missing the Kafka
+// runtime sidecar. The env-ref (plaintext SASL) path points KEDA at the SASL
+// env vars on that sidecar; without it there is no container carrying them, so
+// failing cleanly beats producing a TriggerAuthentication aimed at nothing.
+func TestBuildTriggerAuth_NoSidecar(t *testing.T) {
 	f := fn.Function{
 		Name: "test-func",
 		Run: fn.RunSpec{
 			Kafka: &fn.KafkaConfig{
 				Brokers: "broker:9093", Topic: "t", ConsumerGroup: "g",
-				// Plaintext SASL password -> the env-ref path that indexes Containers[0].
+				// Plaintext SASL password -> the env-ref path that targets the sidecar.
 				SASL: &fn.KafkaSASL{Mechanism: "PLAIN", Password: "literal-secret"},
 			},
 		},
 	}
-	if _, err := buildTriggerAuth(f, &v1.Deployment{}, "default"); err == nil || !strings.Contains(err.Error(), "no containers") {
-		t.Fatalf("expected a no-containers error, got %v", err)
+	if _, err := buildTriggerAuth(f, &v1.Deployment{}, "default"); err == nil || !strings.Contains(err.Error(), k8s.KafkaSidecarName) {
+		t.Fatalf("expected a missing-sidecar error, got %v", err)
 	}
 }
 
@@ -604,7 +572,7 @@ func TestBuildTriggerAuth_UnresolvedCACertReturnsError(t *testing.T) {
 					CACert: "/etc/kafka/ca/ca.crt",
 				},
 			},
-			// No volume backs /etc/kafka/ca: findSecretForPath finds nothing.
+			// No volume backs /etc/kafka/ca: FindSecretForPath finds nothing.
 		},
 	}
 
@@ -787,7 +755,7 @@ func TestBuildTriggerAuth_PlaintextPassword(t *testing.T) {
 
 	// A plaintext password must not be silently dropped: it should be wired
 	// up as an env-based auth reference pointing at the KAFKA_SASL_PASSWORD
-	// env var that pkg/k8s/deployer.go sets on the function's container.
+	// env var that pkg/k8s/deployer.go sets on the Kafka runtime sidecar.
 	if _, ok := spec["secretTargetRef"]; ok {
 		t.Error("did not expect secretTargetRef for a plaintext password")
 	}
@@ -803,6 +771,12 @@ func TestBuildTriggerAuth_PlaintextPassword(t *testing.T) {
 	var sawUser, sawPassword bool
 	for _, e := range envs {
 		entry := e.(map[string]interface{})
+		// The SASL env vars live on the Kafka runtime sidecar, so KEDA must be
+		// pointed there -- not at user-container -- or it reads a container that
+		// never receives the credentials and authentication fails.
+		if entry["containerName"] != k8s.KafkaSidecarName {
+			t.Errorf("%v env containerName = %v, want %v", entry["parameter"], entry["containerName"], k8s.KafkaSidecarName)
+		}
 		switch entry["parameter"] {
 		case "username":
 			sawUser = true
