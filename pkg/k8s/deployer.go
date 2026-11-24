@@ -110,6 +110,8 @@ type Deployer struct {
 	decorator deployer.DeployDecorator
 
 	exposer deployer.Exposer
+
+	autoscaledReplicas bool
 }
 
 func NewDeployer(opts ...DeployerOpt) *Deployer {
@@ -129,6 +131,13 @@ func WithExposer(exposer deployer.Exposer) DeployerOpt {
 func WithDeployerVerbose(verbose bool) DeployerOpt {
 	return func(d *Deployer) {
 		d.verbose = verbose
+	}
+}
+
+// WithAutoscaledReplicas preserves live replicas within scale bounds on update when an autoscaler owns the count.
+func WithAutoscaledReplicas(autoscaledReplicas bool) DeployerOpt {
+	return func(d *Deployer) {
+		d.autoscaledReplicas = autoscaledReplicas
 	}
 }
 
@@ -258,6 +267,9 @@ func (d *Deployer) Deploy(ctx context.Context, f fn.Function) (fn.DeploymentResu
 		if err := preserveDeploymentSelector(existingDeployment, deployment, f.Name); err != nil {
 			return fn.DeploymentResult{}, err
 		}
+		if d.autoscaledReplicas {
+			preserveAutoscaledReplicas(existingDeployment, deployment, f)
+		}
 
 		if _, err = deploymentClient.Update(ctx, deployment, metav1.UpdateOptions{}); err != nil {
 			return fn.DeploymentResult{}, fmt.Errorf("failed to update deployment: %w", err)
@@ -267,6 +279,7 @@ func (d *Deployer) Deploy(ctx context.Context, f fn.Function) (fn.DeploymentResu
 		// exposure and trigger satellites below
 		if svcGetErr == nil {
 			svc.ResourceVersion = existingService.ResourceVersion
+			preserveServiceNetworkFields(svc, existingService)
 			if svc, err = serviceClient.Update(ctx, svc, metav1.UpdateOptions{}); err != nil {
 				return fn.DeploymentResult{}, fmt.Errorf("failed to update service: %w", err)
 			}
@@ -365,6 +378,19 @@ func preserveDeploymentSelector(existing, desired *appsv1.Deployment, fnName str
 		}
 	}
 	return nil
+}
+
+// preserveAutoscaledReplicas keeps the live replica count within the new scale bounds.
+// KEDA's HPA owns spec.replicas, so resetting it rescales the function.
+func preserveAutoscaledReplicas(existing, desired *appsv1.Deployment, f fn.Function) {
+	if existing == nil || existing.Spec.Replicas == nil {
+		return
+	}
+	replicas := max(*existing.Spec.Replicas, *desired.Spec.Replicas)
+	if scale := f.Scale; scale != nil && scale.Max != nil && *scale.Max >= 1 {
+		replicas = int32(min(int64(replicas), *scale.Max))
+	}
+	desired.Spec.Replicas = &replicas
 }
 
 // DeployNamespace is where a function will be deployed: the requested
@@ -860,6 +886,15 @@ func withoutWorkloadAnnotations(annotations map[string]string) map[string]string
 		delete(out, k)
 	}
 	return out
+}
+
+// preserveServiceNetworkFields carries forward the existing Service's
+// network configuration when preparing a generated Service for update.
+func preserveServiceNetworkFields(target, existing *corev1.Service) {
+	target.Spec.ClusterIP = existing.Spec.ClusterIP
+	target.Spec.ClusterIPs = existing.Spec.ClusterIPs
+	target.Spec.IPFamilies = existing.Spec.IPFamilies
+	target.Spec.IPFamilyPolicy = existing.Spec.IPFamilyPolicy
 }
 
 // CheckResourcesArePresent returns error if Secrets or ConfigMaps
