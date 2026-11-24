@@ -9,12 +9,12 @@ import (
 	"sync/atomic"
 
 	"github.com/modelcontextprotocol/go-sdk/mcp"
+	"knative.dev/func/pkg/version"
 )
 
 const (
-	name    = "func"
-	title   = "func"
-	version = "0.1.0"
+	name  = "func"
+	title = "func"
 
 	// EnvMCPWrite is the environment variable that enables write operations
 	// (deploy, delete, and pushing built images) on the MCP server. Set to
@@ -30,6 +30,7 @@ const (
 type Server struct {
 	OnInit    func(context.Context) // Invoked when the server is initialized
 	prefix    string                // Command prefix ("func" or "kn func")
+	version   string                // Computed once at construction; used by healthcheck
 	readonly  atomic.Bool           // disables mutation tools when true
 	executor  executor
 	transport mcp.Transport  // Transport to use (defaults to StdioTransport)
@@ -103,6 +104,7 @@ func WithReadonly(readonly bool) Option {
 func New(options ...Option) *Server {
 	s := &Server{
 		prefix:    "func",
+		version:   version.Vers,
 		transport: &mcp.StdioTransport{},
 		OnInit:    func(_ context.Context) {},
 	}
@@ -117,7 +119,7 @@ func New(options ...Option) *Server {
 		&mcp.Implementation{
 			Name:    name,
 			Title:   title,
-			Version: version},
+			Version: s.version},
 		&mcp.ServerOptions{
 			Instructions:       instructions(s.readonly.Load()),
 			HasPrompts:         true,
@@ -186,7 +188,7 @@ func New(options ...Option) *Server {
 	i.AddResource(newHelpResource(s, "List Help", "help for 'list'", "list"))
 	i.AddResource(newHelpResource(s, "Describe Help", "help for 'describe'", "describe"))
 	i.AddResource(newHelpResource(s, "Logs Help", "help for 'logs'", "logs"))
-	i.AddResource(newHelpResource(s, "Delete Help", "help for delete", "delete"))
+	i.AddResource(newHelpResource(s, "Delete Help", "help for 'delete'", "delete"))
 	i.AddResource(newHelpResource(s, "Run Help", "help for 'run'", "run"))
 
 	i.AddResource(newHelpResource(s, "Volumes Help", "general help for volumes", "config", "volumes"))
@@ -204,6 +206,7 @@ func New(options ...Option) *Server {
 	i.AddResource(newHelpResource(s, "CI Help", "help for 'config ci'", "config", "ci"))
 
 	i.AddResource(newHelpResource(s, "Repository Help", "general help for repository management", "repository"))
+	i.AddResource(newHelpResource(s, "Repository List Help", "help for 'repository list'", "repository", "list"))
 	i.AddResource(newHelpResource(s, "Repository Add Help", "help for 'repository add'", "repository", "add"))
 	i.AddResource(newHelpResource(s, "Repository Rename Help", "help for 'repository rename'", "repository", "rename"))
 	i.AddResource(newHelpResource(s, "Repository Remove Help", "help for 'repository remove'", "repository", "remove"))

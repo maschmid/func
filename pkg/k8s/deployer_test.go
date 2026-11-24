@@ -20,6 +20,7 @@ import (
 	dynamicfakeclient "k8s.io/client-go/dynamic/fake"
 	"k8s.io/client-go/kubernetes/fake"
 	k8stesting "k8s.io/client-go/testing"
+	"k8s.io/utils/ptr"
 	"knative.dev/func/pkg/deployer"
 	fn "knative.dev/func/pkg/functions"
 )
@@ -223,6 +224,141 @@ func TestFindSecretForPath(t *testing.T) {
 	if name != "root-ca" || key != "ca.crt" {
 		t.Errorf("root mount: got (%q, %q), want (root-ca, ca.crt)", name, key)
 	}
+}
+
+// mountNames returns the volume names of a set of mounts, for order-independent
+// comparison in the helper tests below.
+// TestKafkaSidecarVolumeMounts exercises the sidecar mount selection in
+// isolation. The security property (the TLS private key never reaching the user
+// container) is verified end-to-end in Test_generateDeployment_KafkaSidecar;
+// this covers the helper's own branches directly: the nil guards, the
+// no-backing-Secret path, and dedup when one Secret backs several cert paths.
+func TestKafkaSidecarVolumeMounts(t *testing.T) {
+	caSecret, clientSecret, appSecret := "kafka-ca", "kafka-client", "app-config"
+	caPath, clientPath, appPath := "/etc/kafka/ca", "/etc/kafka/client", "/etc/app"
+	volumes := []fn.Volume{
+		{Secret: &caSecret, Path: &caPath},
+		{Secret: &clientSecret, Path: &clientPath},
+		{Secret: &appSecret, Path: &appPath},
+	}
+	// Build the mount set with the real ProcessVolumes rather than by hand, so
+	// the fixture can't silently drift from how the deployer actually names
+	// secret volume mounts.
+	rs, rcm, rpvc := sets.New[string](), sets.New[string](), sets.New[string]()
+	_, allMounts, err := ProcessVolumes(volumes, &rs, &rcm, &rpvc)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// These guards return "nothing selected"; both callers treat a nil and an
+	// empty slice identically (excludeVolumeMounts checks len, and the sidecar's
+	// VolumeMounts is omitempty), so assert on length, not nil, to avoid
+	// breaking on a refactor that returns an empty slice.
+	t.Run("nil kafka selects nothing", func(t *testing.T) {
+		if got := kafkaSidecarVolumeMounts(nil, volumes, allMounts); len(got) != 0 {
+			t.Errorf("expected no mounts for nil kafka, got %+v", got)
+		}
+	})
+
+	t.Run("nil TLS selects nothing", func(t *testing.T) {
+		k := &fn.KafkaConfig{Brokers: "b:9092", Topic: "t", ConsumerGroup: "g"}
+		if got := kafkaSidecarVolumeMounts(k, volumes, allMounts); len(got) != 0 {
+			t.Errorf("expected no mounts when TLS is unset, got %+v", got)
+		}
+	})
+
+	t.Run("TLS with no cert paths selects nothing", func(t *testing.T) {
+		k := &fn.KafkaConfig{TLS: &fn.KafkaTLS{SkipVerify: true}}
+		if got := kafkaSidecarVolumeMounts(k, volumes, allMounts); len(got) != 0 {
+			t.Errorf("expected no mounts when no cert path is set, got %+v", got)
+		}
+	})
+
+	t.Run("cert path with no backing Secret selects nothing", func(t *testing.T) {
+		// The cert path resolves to no Secret volume, so there is nothing to mount.
+		k := &fn.KafkaConfig{TLS: &fn.KafkaTLS{CACert: "/nowhere/ca.crt"}}
+		if got := kafkaSidecarVolumeMounts(k, volumes, allMounts); len(got) != 0 {
+			t.Errorf("expected no mounts when the cert path has no backing Secret, got %+v", got)
+		}
+	})
+
+	t.Run("selects only the Secret that backs the cert", func(t *testing.T) {
+		k := &fn.KafkaConfig{TLS: &fn.KafkaTLS{CACert: "/etc/kafka/ca/ca.crt"}}
+		got := kafkaSidecarVolumeMounts(k, volumes, allMounts)
+		// Compare whole mounts (name AND path), not just names, so a helper that
+		// dropped MountPath would fail here, not only in the end-to-end test.
+		want := []corev1.VolumeMount{allMounts[0]} // the CA secret's mount
+		if !reflect.DeepEqual(got, want) {
+			t.Errorf("selected mounts = %+v, want %+v", got, want)
+		}
+	})
+
+	t.Run("one Secret backing both client cert and key is selected once", func(t *testing.T) {
+		// Mutual TLS: the client cert and key sit in the same Secret directory, so
+		// both resolve to the one secret volume; it must not be selected twice.
+		k := &fn.KafkaConfig{TLS: &fn.KafkaTLS{
+			CACert:     "/etc/kafka/ca/ca.crt",
+			ClientCert: "/etc/kafka/client/tls.crt",
+			ClientKey:  "/etc/kafka/client/tls.key",
+		}}
+		got := kafkaSidecarVolumeMounts(k, volumes, allMounts)
+		// The one client Secret backs both cert and key, so it is selected once: the
+		// result is exactly the CA and client mounts (whole mounts, in input order),
+		// not the client mount twice.
+		want := []corev1.VolumeMount{allMounts[0], allMounts[1]}
+		if !reflect.DeepEqual(got, want) {
+			t.Errorf("selected mounts = %+v, want %+v", got, want)
+		}
+	})
+}
+
+// TestExcludeVolumeMounts covers the user-container filter directly: the
+// empty-exclude fast path, dropping by volume name (so every mount of an
+// excluded volume is removed, not just one), and leaving unrelated mounts.
+func TestExcludeVolumeMounts(t *testing.T) {
+	// One Secret ("secret-kafka-client") mounted at two paths, plus an unrelated
+	// application mount. This exercises excludeVolumeMounts' documented behavior --
+	// dropping every mount of an excluded volume by name -- when handed a partial
+	// exclude list that names only one of the two paths. (The sole production caller
+	// passes the full sidecar mount set, and kafkaSidecarVolumeMounts already returns
+	// every mount of a backing volume, so there path- and name-based exclusion would
+	// behave identically; this pins the helper's behavior in isolation.)
+	all := []corev1.VolumeMount{
+		{Name: "secret-kafka-client", MountPath: "/etc/kafka/client"},
+		{Name: "secret-kafka-client", MountPath: "/mnt/also-client"},
+		{Name: "secret-app-config", MountPath: "/etc/app"},
+	}
+
+	t.Run("empty exclude returns all unchanged", func(t *testing.T) {
+		// Compare element-by-element, not just length: the fast path must return
+		// the input mounts unchanged, not a same-sized set of different mounts.
+		got := excludeVolumeMounts(all, nil)
+		if !reflect.DeepEqual(got, all) {
+			t.Fatalf("expected all mounts unchanged %+v, got %+v", all, got)
+		}
+	})
+
+	t.Run("exclude drops every mount of the named volume", func(t *testing.T) {
+		exclude := []corev1.VolumeMount{{Name: "secret-kafka-client", MountPath: "/etc/kafka/client"}}
+		got := excludeVolumeMounts(all, exclude)
+		// Both /etc/kafka/client and /mnt/also-client are backed by the excluded
+		// volume, so neither may survive; only the app mount remains. Compare the whole
+		// mount so a dropped MountPath is caught here too.
+		want := []corev1.VolumeMount{all[2]}
+		if !reflect.DeepEqual(got, want) {
+			t.Errorf("exclude result = %+v, want %+v", got, want)
+		}
+	})
+
+	t.Run("excluding an absent volume keeps everything", func(t *testing.T) {
+		exclude := []corev1.VolumeMount{{Name: "secret-not-present"}}
+		got := excludeVolumeMounts(all, exclude)
+		// Compare element-by-element: an absent exclude must return the input mounts
+		// unchanged, not merely a same-sized set of different mounts.
+		if !reflect.DeepEqual(got, all) {
+			t.Errorf("excluding an absent volume must keep all mounts unchanged, got %+v", got)
+		}
+	})
 }
 
 func Test_generateDeployment_KafkaSidecar(t *testing.T) {
@@ -2184,5 +2320,158 @@ func Test_createEnvVarSource_EmptyKey(t *testing.T) {
 	_, err := createEnvVarSource([]string{"secret", "my-secret", ""}, &referencedSecrets, &referencedConfigMaps)
 	if err == nil {
 		t.Fatal("expected error for empty source key")
+	}
+}
+
+func Test_preserveAutoscaledReplicas(t *testing.T) {
+	for _, tt := range []struct {
+		name     string
+		existing *appsv1.Deployment
+		desired  int32
+		max      *int64
+		want     int32
+	}{
+		{"live count", &appsv1.Deployment{Spec: appsv1.DeploymentSpec{Replicas: new(int32(6))}}, 1, nil, 6},
+		{"zero becomes one", &appsv1.Deployment{Spec: appsv1.DeploymentSpec{Replicas: new(int32(0))}}, 1, nil, 1},
+		{"raised minimum", &appsv1.Deployment{Spec: appsv1.DeploymentSpec{Replicas: new(int32(2))}}, 5, nil, 5},
+		{"lowered maximum", &appsv1.Deployment{Spec: appsv1.DeploymentSpec{Replicas: new(int32(8))}}, 1, new(int64(3)), 3},
+		{"zero maximum ignored", &appsv1.Deployment{Spec: appsv1.DeploymentSpec{Replicas: new(int32(6))}}, 1, new(int64(0)), 6},
+		{"nil replicas", &appsv1.Deployment{}, 5, nil, 5},
+		{"nil deployment", nil, 5, nil, 5},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			desired := &appsv1.Deployment{Spec: appsv1.DeploymentSpec{Replicas: &tt.desired}}
+			preserveAutoscaledReplicas(tt.existing, desired, fn.Function{Scale: &fn.ScaleOptions{Max: tt.max}})
+			if got := *desired.Spec.Replicas; got != tt.want {
+				t.Errorf("replicas = %d, want %d", got, tt.want)
+			}
+		})
+	}
+}
+
+func TestPreserveServiceNetworkFields(t *testing.T) {
+	tests := []struct {
+		name     string
+		existing *corev1.Service
+	}{
+		{
+			name: "IPv4 single-stack",
+			existing: &corev1.Service{
+				Spec: corev1.ServiceSpec{
+					Type:           corev1.ServiceTypeClusterIP,
+					ClusterIP:      "10.96.1.42",
+					ClusterIPs:     []string{"10.96.1.42"},
+					IPFamilies:     []corev1.IPFamily{corev1.IPv4Protocol},
+					IPFamilyPolicy: ptr.To(corev1.IPFamilyPolicySingleStack),
+				},
+			},
+		},
+		{
+			name: "IPv6 single-stack",
+			existing: &corev1.Service{
+				Spec: corev1.ServiceSpec{
+					Type:           corev1.ServiceTypeClusterIP,
+					ClusterIP:      "fd00::1:42",
+					ClusterIPs:     []string{"fd00::1:42"},
+					IPFamilies:     []corev1.IPFamily{corev1.IPv6Protocol},
+					IPFamilyPolicy: ptr.To(corev1.IPFamilyPolicySingleStack),
+				},
+			},
+		},
+		{
+			name: "dual-stack",
+			existing: &corev1.Service{
+				Spec: corev1.ServiceSpec{
+					Type:           corev1.ServiceTypeClusterIP,
+					ClusterIP:      "10.96.1.42",
+					ClusterIPs:     []string{"10.96.1.42", "fd00::1:42"},
+					IPFamilies:     []corev1.IPFamily{corev1.IPv4Protocol, corev1.IPv6Protocol},
+					IPFamilyPolicy: ptr.To(corev1.IPFamilyPolicyPreferDualStack),
+				},
+			},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			target := &corev1.Service{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:        "my-func",
+					Namespace:   "default",
+					Labels:      map[string]string{"new": "label"},
+					Annotations: map[string]string{"new": "annotation"},
+				},
+				Spec: corev1.ServiceSpec{
+					Type:     corev1.ServiceTypeClusterIP,
+					Selector: map[string]string{"new": "selector"},
+					Ports: []corev1.ServicePort{
+						{Name: "http", Port: 8080, Protocol: corev1.ProtocolTCP},
+					},
+				},
+			}
+
+			preserveServiceNetworkFields(target, tt.existing)
+
+			if target.Spec.ClusterIP != tt.existing.Spec.ClusterIP {
+				t.Errorf("expected ClusterIP %q, got %q", tt.existing.Spec.ClusterIP, target.Spec.ClusterIP)
+			}
+			if !reflect.DeepEqual(target.Spec.ClusterIPs, tt.existing.Spec.ClusterIPs) {
+				t.Errorf("expected ClusterIPs %v, got %v", tt.existing.Spec.ClusterIPs, target.Spec.ClusterIPs)
+			}
+			if !reflect.DeepEqual(target.Spec.IPFamilies, tt.existing.Spec.IPFamilies) {
+				t.Errorf("expected IPFamilies %v, got %v", tt.existing.Spec.IPFamilies, target.Spec.IPFamilies)
+			}
+			if !reflect.DeepEqual(target.Spec.IPFamilyPolicy, tt.existing.Spec.IPFamilyPolicy) {
+				t.Errorf("expected IPFamilyPolicy %v, got %v", tt.existing.Spec.IPFamilyPolicy, target.Spec.IPFamilyPolicy)
+			}
+
+			// Mutable fields already present on target must remain unchanged
+			if target.Labels["new"] != "label" {
+				t.Errorf("expected target labels unchanged, got %v", target.Labels)
+			}
+			if target.Annotations["new"] != "annotation" {
+				t.Errorf("expected target annotations unchanged, got %v", target.Annotations)
+			}
+			if target.Spec.Selector["new"] != "selector" {
+				t.Errorf("expected target selector unchanged, got %v", target.Spec.Selector)
+			}
+			if len(target.Spec.Ports) != 1 || target.Spec.Ports[0].Port != 8080 {
+				t.Errorf("expected target ports unchanged, got %v", target.Spec.Ports)
+			}
+		})
+	}
+}
+
+func TestGenerateServiceLeavesNetworkFieldsUnset(t *testing.T) {
+	d := &Deployer{}
+	f := fn.Function{
+		Name:    "test-func",
+		Runtime: "go",
+	}
+	deployment := &appsv1.Deployment{
+		ObjectMeta: metav1.ObjectMeta{
+			Name: "test-func",
+			UID:  "test-uid",
+		},
+	}
+
+	labels, anns := testMeta(t, f)
+	svc, err := d.generateService(f, "default", labels, anns, deployment, nil)
+	if err != nil {
+		t.Fatalf("generateService failed: %v", err)
+	}
+
+	// For new service creation, ClusterIP must be left unset so Kubernetes can allocate it
+	if svc.Spec.ClusterIP != "" {
+		t.Errorf("expected empty ClusterIP on newly generated service, got %q", svc.Spec.ClusterIP)
+	}
+	if svc.Spec.ClusterIPs != nil {
+		t.Errorf("expected nil ClusterIPs on newly generated service, got %v", svc.Spec.ClusterIPs)
+	}
+	if svc.Spec.IPFamilies != nil {
+		t.Errorf("expected nil IPFamilies on newly generated service, got %v", svc.Spec.IPFamilies)
+	}
+	if svc.Spec.IPFamilyPolicy != nil {
+		t.Errorf("expected nil IPFamilyPolicy on newly generated service, got %v", svc.Spec.IPFamilyPolicy)
 	}
 }
